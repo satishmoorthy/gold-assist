@@ -150,7 +150,7 @@ if question:
         with st.spinner("Analyzing..."):
             try:
                 response = client.chat.completions.create(
-                    model="google/gemini-2.0-flash-exp:free",
+                    model="openrouter/free",
                     messages=st.session_state.messages,
                     max_tokens=800
                 )
