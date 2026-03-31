@@ -4,7 +4,7 @@ import os
 import pyotp
 import pandas as pd
 import altair as alt
-from smartapi import SmartConnect
+from SmartApi import SmartConnect
 from dotenv import load_dotenv
 
 load_dotenv()
