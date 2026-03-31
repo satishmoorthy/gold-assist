@@ -2,7 +2,9 @@ import streamlit as st
 from openai import OpenAI
 import os
 import requests
-from datetime import datetime, timedelta, timezone
+import yfinance as yf
+import pandas as pd
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -12,132 +14,229 @@ client = OpenAI(
     base_url="https://openrouter.ai/api/v1"
 )
 
-BASE_URL = "https://api.gold-api.com"
-USD_INR_URL = "https://open.er-api.com/v6/latest/USD"  # free, no key needed
-
 # ── Fetch live USD/INR rate ────────────────────────────────────────────────────
 @st.cache_data(ttl=3600)
 def get_usd_inr():
     try:
-        r = requests.get(USD_INR_URL, timeout=5)
-        return r.json()["rates"]["INR"]
+        ticker = yf.Ticker("USDINR=X")
+        data = ticker.fast_info
+        return float(data["last_price"])
     except:
-        return 83.5  # fallback rate
+        try:
+            r = requests.get("https://open.er-api.com/v6/latest/USD", timeout=5)
+            return r.json()["rates"]["INR"]
+        except:
+            return 83.5
 
 # ── Fetch live gold price ──────────────────────────────────────────────────────
 @st.cache_data(ttl=60)
-def get_gold_price():
+def get_live_gold_inr():
     try:
-        r = requests.get(f"{BASE_URL}/price/XAU", timeout=5)
+        r = requests.get("https://api.gold-api.com/price/XAU", timeout=5)
         d = r.json()
+        usd_price = d.get("price", 0)
+        change_usd = d.get("ch", 0)
+        change_pct = d.get("chp", 0)
+        inr_rate = get_usd_inr()
+        troy_to_gram = 31.1035
+        price_per_gram = (usd_price / troy_to_gram) * inr_rate
+        change_per_gram = (change_usd / troy_to_gram) * inr_rate
         return {
-            "price": d.get("price", 0),
-            "change": d.get("ch", 0),
-            "change_pct": d.get("chp", 0),
+            "per_gram": price_per_gram,
+            "per_10g": price_per_gram * 10,
+            "change_per_gram": change_per_gram,
+            "change_pct": change_pct,
+            "inr_rate": inr_rate,
             "timestamp": d.get("updatedAt", "")
         }
-    except:
-        return {"price": 0, "change": 0, "change_pct": 0, "timestamp": ""}
+    except Exception as e:
+        return None
 
-# ── Fetch 30-day historical data ───────────────────────────────────────────────
+# ── Fetch historical gold data in INR ─────────────────────────────────────────
 @st.cache_data(ttl=3600)
-def get_gold_history():
-    prices = []
-    dates = []
-    today = datetime.now(timezone.utc)
-    for i in range(29, -1, -1):
-        day = today - timedelta(days=i)
-        # skip weekends (markets closed)
-        if day.weekday() >= 5:
-            continue
-        date_str = day.strftime("%Y%m%d")
-        label = day.strftime("%d %b")
-        try:
-            r = requests.get(f"{BASE_URL}/price/XAU/{date_str}", timeout=5)
-            if r.status_code == 200:
-                d = r.json()
-                price = d.get("price", 0)
-                if price and price > 0:
-                    prices.append(price)
-                    dates.append(label)
-        except:
-            continue
-    return dates, prices
+def get_historical_inr(period="1mo", interval="1d"):
+    try:
+        gold = yf.download("GC=F", period=period, interval=interval, progress=False)
+        fx   = yf.download("USDINR=X", period=period, interval=interval, progress=False)
+
+        gold_close = gold["Close"].squeeze()
+        fx_close   = fx["Close"].squeeze()
+
+        fx_close   = fx_close.reindex(gold_close.index, method="ffill")
+        inr_series = (gold_close / 31.1035) * fx_close
+        inr_series = inr_series.dropna()
+        inr_series.name = "₹ per gram (24K)"
+        return inr_series
+    except Exception as e:
+        return None
+
+# ── Compute change vs N days ago ──────────────────────────────────────────────
+def compute_change(series, current_price):
+    if series is None or len(series) < 2:
+        return None, None
+    old_price = float(series.iloc[0])
+    change    = current_price - old_price
+    pct       = (change / old_price) * 100
+    return change, pct
 
 # ── Page config ────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Gold Assist", page_icon="💰", layout="wide")
+st.set_page_config(page_title="Gold Assist 🇮🇳", page_icon="💰", layout="wide")
 st.title("💰 Gold Assist")
-st.caption("AI-powered gold investment advisor • Live data by gold-api.com (free, unlimited)")
+st.caption("Live 24K gold prices for Indian investors • Powered by gold-api.com + yfinance")
 
-# ── Fetch data ─────────────────────────────────────────────────────────────────
-gold = get_gold_price()
-inr_rate = get_usd_inr()
+# ── Fetch live data ────────────────────────────────────────────────────────────
+gold = get_live_gold_inr()
 
-usd_price = gold["price"]
-troy_oz_to_gram = 31.1035
-price_per_gram_usd = usd_price / troy_oz_to_gram
-price_per_gram_inr = price_per_gram_usd * inr_rate
-price_per_10g_inr = price_per_gram_inr * 10
+if gold:
+    per_gram    = gold["per_gram"]
+    per_10g     = gold["per_10g"]
+    change_gram = gold["change_per_gram"]
+    change_pct  = gold["change_pct"]
+    ts          = gold["timestamp"][:16] if gold["timestamp"] else "Live"
 
-# ── USD Metrics ────────────────────────────────────────────────────────────────
-st.subheader("🌍 International Price (USD)")
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("🥇 Gold Spot (XAU/USD)", f"${usd_price:,.2f}")
-col2.metric("📈 24h Change ($)", f"${gold['change']:+.2f}")
-col3.metric("📊 24h Change (%)", f"{gold['change_pct']:+.2f}%")
-col4.metric("🕐 Last Updated", gold["timestamp"][:16] if gold["timestamp"] else "Live")
+    # ── Hero price ─────────────────────────────────────────────────────────────
+    st.markdown(f"""
+    <div style='padding: 1.2rem 0 0.5rem 0'>
+        <span style='font-size: 2.8rem; font-weight: 700; color: var(--color-text-primary)'>
+            ₹{per_gram:,.0f}
+        </span>
+        <span style='font-size: 1.1rem; color: var(--color-text-secondary); margin-left: 10px'>
+            per gram · 24K · Last updated {ts}
+        </span>
+    </div>
+    """, unsafe_allow_html=True)
 
-st.divider()
-
-# ── Indian Price (24K) ─────────────────────────────────────────────────────────
-st.subheader("🇮🇳 Indian Price (24K Gold)")
-col1, col2, col3 = st.columns(3)
-col1.metric("💛 Per Gram (24K)", f"₹{price_per_gram_inr:,.0f}")
-col2.metric("💛 Per 10 Grams (24K)", f"₹{price_per_10g_inr:,.0f}")
-col3.metric("💱 USD/INR Rate", f"₹{inr_rate:.2f}")
-st.caption("ℹ️ Indian price = spot price converted at live USD/INR rate. Jeweller rates may include GST (3%) + making charges.")
-
-st.divider()
-
-# ── 30-Day Chart ───────────────────────────────────────────────────────────────
-with st.expander("📉 30-Day Gold Price Trend (USD/oz)", expanded=True):
-    with st.spinner("Loading historical data..."):
-        dates, prices = get_gold_history()
-
-    if prices and len(prices) > 1:
-        import pandas as pd
-        df = pd.DataFrame({"Date": dates, "Price (USD/oz)": prices})
-        df = df.set_index("Date")
-
-        col_chart, col_stats = st.columns([3, 1])
-        with col_chart:
-            st.line_chart(df, use_container_width=True)
-        with col_stats:
-            st.markdown("**30-Day Stats**")
-            st.metric("High", f"${max(prices):,.2f}")
-            st.metric("Low", f"${min(prices):,.2f}")
-            st.metric("Avg", f"${sum(prices)/len(prices):,.2f}")
-            change_30d = prices[-1] - prices[0]
-            change_30d_pct = (change_30d / prices[0]) * 100
-            st.metric("30d Move", f"${change_30d:+.2f}", f"{change_30d_pct:+.2f}%")
-    else:
-        st.info("Historical data temporarily unavailable.")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Per Gram (24K)",   f"₹{per_gram:,.0f}",  f"₹{change_gram:+.0f} today")
+    col2.metric("Per 10 Grams",     f"₹{per_10g:,.0f}",   f"{change_pct:+.2f}% today")
+    col3.metric("USD/INR Rate",     f"₹{gold['inr_rate']:.2f}")
+    col4.metric("Data source",      "gold-api.com", "Free & unlimited")
+else:
+    st.error("Could not fetch live gold price. Please refresh.")
+    per_gram = 0
 
 st.divider()
 
-# ── Chat ───────────────────────────────────────────────────────────────────────
+# ── Period buttons ─────────────────────────────────────────────────────────────
+st.subheader("📈 Price History (24K Gold · ₹/gram)")
+
+PERIODS = {
+    "1D":  ("1d",  "5m"),
+    "1W":  ("5d",  "1h"),
+    "1M":  ("1mo", "1d"),
+    "3M":  ("3mo", "1d"),
+    "1Y":  ("1y",  "1wk"),
+    "5Y":  ("5y",  "1mo"),
+}
+
+if "chart_period" not in st.session_state:
+    st.session_state.chart_period = "1M"
+
+cols = st.columns(len(PERIODS))
+for i, label in enumerate(PERIODS):
+    if cols[i].button(
+        label,
+        use_container_width=True,
+        type="primary" if st.session_state.chart_period == label else "secondary"
+    ):
+        st.session_state.chart_period = label
+
+selected         = st.session_state.chart_period
+period, interval = PERIODS[selected]
+
+with st.spinner(f"Loading {selected} data..."):
+    hist = get_historical_inr(period, interval)
+
+if hist is not None and len(hist) > 1:
+    df_chart = hist.reset_index()
+    df_chart.columns = ["Date", "₹ per gram (24K)"]
+    df_chart["Date"] = pd.to_datetime(df_chart["Date"])
+
+    # Area chart via Altair
+    import altair as alt
+    base = alt.Chart(df_chart).mark_area(
+        line={"color": "#F4A623", "strokeWidth": 2},
+        color=alt.Gradient(
+            gradient="linear",
+            stops=[
+                alt.GradientStop(color="#F4A623", offset=0),
+                alt.GradientStop(color="rgba(244,166,35,0.05)", offset=1),
+            ],
+            x1=0, x2=0, y1=0, y2=1,
+        )
+    ).encode(
+        x=alt.X("Date:T", axis=alt.Axis(format="%d %b %y", labelAngle=-30, title="")),
+        y=alt.Y("₹ per gram (24K):Q",
+                scale=alt.Scale(zero=False),
+                axis=alt.Axis(title="₹ per gram", format=",.0f")),
+        tooltip=[
+            alt.Tooltip("Date:T", format="%d %b %Y"),
+            alt.Tooltip("₹ per gram (24K):Q", format=",.0f", title="₹/gram")
+        ]
+    ).properties(height=360)
+
+    st.altair_chart(base, use_container_width=True)
+
+    # Change stats for selected period
+    change_val, change_pct_period = compute_change(hist, per_gram)
+    if change_val is not None:
+        direction = "🟢" if change_val >= 0 else "🔴"
+        st.markdown(
+            f"{direction} **{selected} change:** "
+            f"₹{change_val:+,.0f}/gram &nbsp;|&nbsp; **{change_pct_period:+.2f}%**"
+        )
+else:
+    st.info("Historical data temporarily unavailable for this period.")
+
+st.divider()
+
+# ── Change summary table ───────────────────────────────────────────────────────
+st.subheader("📊 Change Summary")
+
+summary_data = []
+summary_periods = [
+    ("1 Day",   "2d",  "1h"),
+    ("1 Week",  "5d",  "1h"),
+    ("1 Month", "1mo", "1d"),
+    ("3 Months","3mo", "1d"),
+    ("1 Year",  "1y",  "1wk"),
+]
+
+for label, p, iv in summary_periods:
+    data = get_historical_inr(p, iv)
+    if data is not None and len(data) > 1:
+        chg, pct = compute_change(data, per_gram)
+        if chg is not None:
+            arrow = "▲" if chg >= 0 else "▼"
+            summary_data.append({
+                "Period":      label,
+                "Change (₹/g)": f"{arrow} ₹{abs(chg):,.0f}",
+                "Change (%)":   f"{arrow} {abs(pct):.2f}%",
+                "Trend":        "🟢 Up" if chg >= 0 else "🔴 Down"
+            })
+
+if summary_data:
+    st.dataframe(
+        pd.DataFrame(summary_data),
+        hide_index=True,
+        use_container_width=True
+    )
+
+st.divider()
+
+# ── AI Chat ────────────────────────────────────────────────────────────────────
 if "messages" not in st.session_state:
     st.session_state.messages = [
         {
             "role": "system",
             "content": (
-                "You are an expert financial assistant specializing in gold investments for Indian investors. "
-                "You will be given real-time gold price data including USD and INR prices. "
-                "Give clear, practical advice about: current price analysis, market trends, "
-                "risks vs benefits, and investment strategies like physical gold (coins/bars), "
-                "Sovereign Gold Bonds (SGBs), Gold ETFs, digital gold, and jewellery. "
-                "Always mention Indian-specific options like SGBs which give 2.5% annual interest. "
-                "Be concise and data-driven. Always remind users this is not professional financial advice."
+                "You are an expert financial assistant for Indian gold investors. "
+                "You receive live 24K gold prices in INR. "
+                "Give practical advice on physical gold, Sovereign Gold Bonds (SGBs — 2.5% annual interest), "
+                "Gold ETFs, digital gold, and jewellery. "
+                "Factor in Indian taxes: LTCG (>3 years = 20% with indexation), "
+                "STT on ETFs, and 3% GST on physical gold. "
+                "Be concise and data-driven. Remind users this is not SEBI-registered advice."
             )
         }
     ]
@@ -146,24 +245,22 @@ for msg in st.session_state.messages[1:]:
     with st.chat_message(msg["role"]):
         st.write(msg["content"])
 
-question = st.chat_input("Ask about gold investment... e.g. 'Is now a good time to buy gold in India?'")
+question = st.chat_input("Ask about gold investment... e.g. 'Should I buy SGBs or Gold ETFs?'")
 
 if question:
-    trend_summary = ""
-    if prices and len(prices) >= 2:
-        trend_summary = (
-            f"30-day trend: from ${prices[0]:,.2f} to ${prices[-1]:,.2f} "
-            f"(30d high: ${max(prices):,.2f}, 30d low: ${min(prices):,.2f})"
-        )
+    # build summary for AI context
+    change_lines = "\n".join(
+        f"  - {row['Period']}: {row['Change (₹/g)']} ({row['Change (%)']})"
+        for row in summary_data
+    ) if summary_data else "  - Historical data unavailable"
 
-    context = f"""[Live Market Data]
-- Gold spot price: ${usd_price:,.2f} USD/troy oz
-- 24h change: ${gold['change']:+.2f} ({gold['change_pct']:+.2f}%)
-- Indian 24K price: ₹{price_per_gram_inr:,.0f}/gram | ₹{price_per_10g_inr:,.0f}/10g
-- USD/INR rate: ₹{inr_rate:.2f}
-- {trend_summary}
+    context = f"""[Live Market Data — INR]
+- 24K gold: ₹{per_gram:,.0f}/gram | ₹{per_gram*10:,.0f}/10g
+- Today's change: ₹{change_gram:+.0f}/gram ({change_pct:+.2f}%)
+- USD/INR: ₹{gold['inr_rate']:.2f}
+- Period changes:
+{change_lines}
 """
-
     full_message = f"{context}\nUser question: {question}"
     st.session_state.messages.append({"role": "user", "content": full_message})
 
@@ -185,4 +282,4 @@ if question:
                 st.error(f"AI Error: {str(e)}")
 
 st.divider()
-st.caption("⚠️ Not financial advice. Consult a SEBI-registered advisor before investing.")
+st.caption("⚠️ Not SEBI-registered financial advice. Prices exclude GST & making charges. Consult a registered advisor before investing.")
